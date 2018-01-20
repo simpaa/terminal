@@ -2,10 +2,12 @@
 <img src="readme-resources/hero.png" alt="Terminal for iOS">
 </p>
 
-<h1 align="center">Terminal for iOS</h1>
+<h1 align="center">OpenTerm</h1>
 
 <p align="center">
 <a href="https://itunes.apple.com/app/terminal/id1323205755?mt=8&at=1010lII4"><img src="readme-resources/app_store_badge.svg" alt="Download on the App Store"/></a>
+<br><span align="center">(Previously called Terminal for iOS)</span>
+
 </p>
 
 <p align="center">
@@ -38,7 +40,7 @@ Commands included:
 This project uses a modified version of [ios_system](https://github.com/holzschu/ios_system), which requires OpenSSL. For convenience both of these are included in the `Dependencies` folder.
 
 ## Running
-Open `Terminal.xcworkspace`, change the bundle identifier to an identifier linked to your Apple developer account in order to run. Build using the `Terminal` scheme. Please note that with the current setup you can only build for arm64 (so no iOS simulator).
+Open `OpenTerm.xcworkspace`, change the bundle identifier to an identifier linked to your Apple developer account in order to run. Build using the `OpenTerm` scheme. Please note that with the current setup you can only build for arm64 (so no iOS simulator).
 
 ## License
 
