@@ -10,134 +10,241 @@ import Foundation
 import ios_system
 
 protocol CommandExecutorDelegate: class {
-    func commandExecutor(_ commandExecutor: CommandExecutor, receivedStdout stdout: String)
-    func commandExecutor(_ commandExecutor: CommandExecutor, receivedStderr stderr: String)
-    func commandExecutor(_ commandExecutor: CommandExecutor, didFinishDispatchWithExitCode exitCode: Int32)
+	func commandExecutor(_ commandExecutor: CommandExecutor, receivedStdout stdout: Data)
+	func commandExecutor(_ commandExecutor: CommandExecutor, receivedStderr stderr: Data)
+	func commandExecutor(_ commandExecutor: CommandExecutor, didChangeWorkingDirectory to: URL)
+	func commandExecutor(_ commandExecutor: CommandExecutor, stateDidChange newState: CommandExecutor.State)
+	func commandExecutor(_ commandExecutor: CommandExecutor, waitForInput callback: @escaping (String) -> Void)
+	func commandExecutor(_ commandExecutor: CommandExecutor, executeSubCommand subCommand: String, callback: @escaping (Int) -> Void)
+	func commandExecutor(_ commandExecutor: CommandExecutor, executeSubCommand subCommand: String, capturingOutput callback: @escaping (String) -> Void)
 }
 
 // Exit status from an ios_system command
 typealias ReturnCode = Int32
 
 protocol CommandExecutorCommand {
-    // Run the command
-    func run(forExecutor executor: CommandExecutor) throws -> ReturnCode
+	// Run the command
+	func run(forExecutor executor: CommandExecutor) throws -> ReturnCode
 }
 
 /// Utility that executes commands serially to ios_system.
 /// Has its own stdout/stderr, and passes output & results to its delegate.
 class CommandExecutor {
 
-    weak var delegate: CommandExecutorDelegate?
+	enum State {
+		case idle
+		case running
+		case waitingForInput
+	}
 
-    /// Dispatch queue to serially run commands on.
-    private let queue = DispatchQueue(label: "CommandExecutor", qos: .userInteractive)
+	var state: State = .idle {
+		didSet {
+			delegate?.commandExecutor(self, stateDidChange: state)
+		}
+	}
 
-    // Create new pipes for our own stdout/stderr
-    private let stdout = Pipe()
-    private let stderr = Pipe()
-    fileprivate let stdout_file: UnsafeMutablePointer<FILE>?
-    fileprivate let stderr_file: UnsafeMutablePointer<FILE>?
+	weak var delegate: CommandExecutorDelegate?
 
-    /// Context from commands run by this executor
-    private var context = CommandExecutionContext()
+	// The current working directory for this executor.
+	var currentWorkingDirectory: URL {
+		didSet {
+			delegateQueue.async {
+				self.delegate?.commandExecutor(self, didChangeWorkingDirectory: self.currentWorkingDirectory)
+			}
+		}
+	}
 
-    init() {
-        // Get file for stdout/stderr that can be written to
-        stdout_file = fdopen(stdout.fileHandleForWriting.fileDescriptor, "w")
-        stderr_file = fdopen(stderr.fileHandleForWriting.fileDescriptor, "w")
+	/// Dispatch queue that delegate methods will be called on.
+	private let delegateQueue = DispatchQueue(label: "CommandExecutor-Delegate", qos: .userInteractive)
 
-        // Call the following functions when data is written to stdout/stderr.
-        stdout.fileHandleForReading.readabilityHandler = self.onStdout
-        stderr.fileHandleForReading.readabilityHandler = self.onStderr
-    }
+	// Create new pipes for our own stdout/stderr
+	private let stdin_pipe = Pipe()
+	private let stdout_pipe = Pipe()
+	private let stderr_pipe = Pipe()
+	fileprivate let stdin_file: UnsafeMutablePointer<FILE>
+	private let stdout_file: UnsafeMutablePointer<FILE>
+	private let stderr_file: UnsafeMutablePointer<FILE>
 
-    // Dispatch a new text-based command to execute.
-    func dispatch(_ command: String) {
-        queue.async {
-            let returnCode: ReturnCode
-            do {
-                let executorCommand = self.executorCommand(forCommand: command, inContext: self.context)
-                returnCode = try executorCommand.run(forExecutor: self)
-            } catch {
-                returnCode = 1
-                // If an error was thrown while running, send it to the stderr
-                DispatchQueue.main.async {
-                    self.delegate?.commandExecutor(self, receivedStderr: error.localizedDescription)
-                }
-            }
+	/// Context from commands run by this executor
+	var context = CommandExecutionContext()
 
-            /// Save return code into the context
-            self.context[.status] = "\(returnCode)"
+	init() {
+		self.currentWorkingDirectory = DocumentManager.shared.activeDocumentsFolderURL
 
-            // Wait a bit to allow final stdout/stderr to get read.
-            // TODO: This should not be needed, but it seems without it, output comes in after ios_system returns.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                self.delegate?.commandExecutor(self, didFinishDispatchWithExitCode: returnCode)
-            }
-        }
-    }
+		// Get file for stdin that can be read from
+		stdin_file = fdopen(stdin_pipe.fileHandleForReading.fileDescriptor, "r")
+		// Get file for stdout/stderr that can be written to
+		stdout_file = fdopen(stdout_pipe.fileHandleForWriting.fileDescriptor, "w")
+		stderr_file = fdopen(stderr_pipe.fileHandleForWriting.fileDescriptor, "w")
 
-    /// Take user-entered command, decide what to do with it, then return an executor command that will do the work.
-    func executorCommand(forCommand command: String, inContext context: CommandExecutionContext) -> CommandExecutorCommand {
-        // Apply context to the given command
-        let command = context.apply(toCommand: command)
+		// Call the following functions when data is written to stdout/stderr.
+		stdout_pipe.fileHandleForReading.readabilityHandler = self.onStdout
+		stderr_pipe.fileHandleForReading.readabilityHandler = self.onStderr
+	}
 
-        // Separate in to command and arguments
-        let components = command.components(separatedBy: .whitespaces)
-        guard components.count > 0 else { return EmptyExecutorCommand() }
-        let program = components[0]
-        let args = Array(components[1..<components.endIndex])
+	// Dispatch a new text-based command to execute.
+	func dispatch(_ command: String) {
 
-        // Special case for scripts
-        if Script.allNames.contains(program), let script = try? Script.named(program) {
-            return ScriptExecutorCommand(script: script, arguments: args, context: context)
-        }
+		let queue = DispatchQueue(label: "\(command)", qos: .utility)
+		
+		queue.async {
+		
+			Thread.current.name = command
+		
+			self.state = .running
 
-        // Default case: Just execute the string itself
-        return SystemExecutorCommand(command: command)
-    }
+			DocumentManager.shared.currentDirectoryURL = self.currentWorkingDirectory
+			// Set the executor's CWD as the process-wide CWD
+			ios_switchSession(self.stdout_file)
+			ios_setDirectoryURL(self.currentWorkingDirectory)
+			ios_setStreams(self.stdin_file, self.stdout_file, self.stderr_file)
+			let returnCode: ReturnCode
+			do {
+				let executorCommand = self.executorCommand(forCommand: command, inContext: self.context)
+				returnCode = try executorCommand.run(forExecutor: self)
+			} catch {
+				returnCode = 1
+				// If an error was thrown while running, send it to the stderr
+				self.delegateQueue.async {
+					self.delegate?.commandExecutor(self, receivedStderr: error.localizedDescription.data(using: .utf8)!)
+				}
+			}
 
-    // Called when the stdout file handle is written to
-    private func onStdout(_ stdout: FileHandle) {
-        guard let str = String(data: stdout.availableData, encoding: .utf8), !str.isEmpty else { return }
-        DispatchQueue.main.async {
-            self.delegate?.commandExecutor(self, receivedStdout: str)
-        }
-    }
+			// Save the current process-wide CWD to our value
+			let newDirectory = DocumentManager.shared.currentDirectoryURL
+			if newDirectory != self.currentWorkingDirectory {
+				self.currentWorkingDirectory = newDirectory
+				// Reset the process-wide CWD back to documents folder
+				DocumentManager.shared.currentDirectoryURL = DocumentManager.shared.activeDocumentsFolderURL
+			}
 
-    // Called when the stderr file handle is written to
-    private func onStderr(_ stderr: FileHandle) {
-        guard let str = String(data: stderr.availableData, encoding: .utf8), !str.isEmpty else { return }
-        DispatchQueue.main.async {
-            self.delegate?.commandExecutor(self, receivedStderr: str)
-        }
-    }
-}
+			// Save return code into the context
+			self.context[.status] = "\(returnCode)"
 
-/// Basic implementation of a command, run ios_system
-struct SystemExecutorCommand: CommandExecutorCommand {
+			// Write the end code to stdout_pipe
+			// TODO: Also need to send to stderr?
+			self.stdout_pipe.fileHandleForWriting.write(Parser.Code.endOfTransmission.rawValue.data(using: .utf8)!)
 
-    let command: String
+			self.state = .idle
+		}
+	}
+	
+	func closeSession() {
+		// Warn ios_system to release all data associated with this session:
+		// current directory, previous directory...
+		ios_closeSession(self.stdout_file)
+	}
+	
+	func setLocalMiniRoot() {
+		ios_switchSession(self.stdout_file)
+		ios_setMiniRootURL(self.currentWorkingDirectory)
+	}
 
-    func run(forExecutor executor: CommandExecutor) throws -> ReturnCode {
-        // Set the stdout/stderr of the thread to the custom stdout/stderr.
-        thread_stdout = executor.stdout_file
-        thread_stderr = executor.stderr_file
 
-        // Pass the value of the string to system, return its exit code.
-        let returnCode = ios_system(command.utf8CString)
-        
-        // Flush stdout and stderr before returning, so all output is finished before marking command as complete.
-        fflush(executor.stdout_file)
-        fflush(executor.stderr_file)
+	// Send input to the running command's stdin.
+	func sendInput(_ input: String) {
+		guard self.state == .running, let data = input.data(using: .utf8) else {
+			return
+		}
+		
+		ios_switchSession(self.stdout_file)
+		switch input {
+		case Parser.Code.endOfText.rawValue, Parser.Code.endOfTransmission.rawValue:
+			// Kill running process in the current session (tab) on CTRL+C or CTRL+D.
+			// No way to send different kill signals since ios_system/pthread are running in process.
+			ios_kill()
+		default:
+			stdin_pipe.fileHandleForWriting.write(data)
+		}
+	}
 
-        return returnCode
-    }
-}
+	/// Take user-entered command, decide what to do with it, then return an executor command that will do the work.
+	func executorCommand(forCommand command: String, inContext context: CommandExecutionContext) -> CommandExecutorCommand {
+		// Apply context to the given command
+		let command = context.apply(toCommand: command)
 
-/// No-op command to run.
-struct EmptyExecutorCommand: CommandExecutorCommand {
-    func run(forExecutor executor: CommandExecutor) throws -> ReturnCode {
-        return 0
-    }
+		// Separate in to command and arguments
+		let components = command.components(separatedBy: .whitespaces)
+		guard components.count > 0 else {
+			return EmptyExecutorCommand()
+		}
+		
+		let program = components[0]
+		let args = Array(components[1..<components.endIndex])
+		
+		var parsedArgs = [String]()
+		
+		var currentArg = ""
+		
+		for arg in args {
+			
+			if arg.hasPrefix("\"") {
+				
+				if currentArg.isEmpty {
+
+					currentArg = arg
+					currentArg.removeFirst()
+					
+				} else {
+					
+					currentArg.append(" " + arg)
+					
+				}
+				
+			} else if arg.hasSuffix("\"") {
+
+				if currentArg.isEmpty {
+
+					currentArg.append(arg)
+
+				} else {
+					
+					currentArg.append(" " + arg)
+					currentArg.removeLast()
+					parsedArgs.append(currentArg)
+					currentArg = ""
+
+				}
+
+			} else {
+				
+				if currentArg.isEmpty {
+					parsedArgs.append(arg)
+				} else {
+					currentArg.append(" " + arg)
+				}
+				
+			}
+		
+		}
+		
+		if !currentArg.isEmpty {
+			parsedArgs.append(currentArg)
+		}
+
+		// Special case for scripts
+		if let scriptDocument = CommandManager.shared.script(named: program) {
+			return ScriptExecutorCommand(script: scriptDocument, arguments: parsedArgs, context: context)
+		}
+
+		// Default case: Just execute the string itself
+		return SystemExecutorCommand(command: command)
+	}
+
+	// Called when the stdout file handle is written to
+	private func onStdout(_ stdout: FileHandle) {
+		let data = stdout.availableData
+		delegateQueue.async {
+			self.delegate?.commandExecutor(self, receivedStdout: data)
+		}
+	}
+
+	// Called when the stderr file handle is written to
+	private func onStderr(_ stderr: FileHandle) {
+		let data = stderr.availableData
+		delegateQueue.async {
+			self.delegate?.commandExecutor(self, receivedStderr: data)
+		}
+	}
+
 }
